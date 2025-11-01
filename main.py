@@ -71,7 +71,7 @@ os.makedirs(BULK_RESULTS_BASE_DIR, exist_ok=True)
 logger.info(f"Bulk analysis reports will be stored in: {BULK_RESULTS_BASE_DIR}")
 
 # CORS Origins
-_frontend_urls_env = os.getenv("FRONTEND_URLS", "http://localhost:3000,http://localhost:3001")
+_frontend_urls_env = os.getenv("FRONTEND_URLS", "http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173")
 CORS_ORIGINS = [url.strip() for url in _frontend_urls_env.split(',')]
 
 # JWT Configuration
@@ -488,20 +488,52 @@ async def lifespan(app: FastAPI):
     logger.info("Closing MongoDB connection.")
     await close_mongo_connection()
 
+# -----------------------------
+# CORS Middleware - COMPLETE FIX
+# -----------------------------
+
+# Add this RIGHT AFTER creating your FastAPI app
 app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan, default_response_class=ORJSONResponse)
 
-# -----------------------------
-# CORS Middleware
-# -----------------------------
+# COMPLETE CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173", 
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
 
+# Add this OPTIONS handler for preflight requests
+@app.options("/{rest_of_path:path}")
+async def preflight_handler():
+    return JSONResponse(content={"status": "ok"})
+
+# Add this middleware to handle CORS headers
+@app.middleware("http")
+async def add_cors_header(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000"
+    ]
+    
+    if origin in allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    
+    return response
 
 # -----------------------------
 # Authentication Endpoints
@@ -530,6 +562,205 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         expires_delta=access_token_expires,
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+# -----------------------------
+# Separate Authentication Endpoints for Different Portals
+# -----------------------------
+
+@app.post("/admin/login", response_model=Token)
+async def admin_portal_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login endpoint for Admin Portal (Super Admin + Dealer Admin only)
+    """
+    user_doc = await users_collection.find_one({"username": form_data.username})
+    if not user_doc or not verify_password(form_data.password, user_doc["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # RESTRICT: Only allow admin roles to login via admin portal
+    if user_doc["role"] not in ["super_admin", "dealer_admin"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please use the dealer portal to login"
+        )
+    
+    dealer_id_str = user_doc.get("dealer_id")
+
+    access_token_expires = timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": user_doc["username"],
+            "user_id": str(user_doc["_id"]),
+            "role": user_doc["role"],
+            "dealer_id": dealer_id_str,
+        },
+        expires_delta=access_token_expires,
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/dealer/login", response_model=Token)
+async def dealer_portal_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Login endpoint for Dealer User Portal (Dealer Users only)
+    """
+    user_doc = await users_collection.find_one({"username": form_data.username})
+    if not user_doc or not verify_password(form_data.password, user_doc["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # RESTRICT: Only allow dealer users to login via dealer portal
+    if user_doc["role"] != "dealer_user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please use the admin portal to login"
+        )
+    
+    dealer_id_str = user_doc.get("dealer_id")
+
+    access_token_expires = timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={
+            "sub": user_doc["username"],
+            "user_id": str(user_doc["_id"]),
+            "role": user_doc["role"],
+            "dealer_id": dealer_id_str,
+        },
+        expires_delta=access_token_expires,
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+# Dealer User Specific Endpoints
+# -----------------------------
+
+@app.get("/dealer/dashboard/overview")
+async def get_dealer_user_dashboard(current_user: UserInDB = Depends(get_current_user)):
+    """
+    Simplified dashboard for dealer users (all dealership data)
+    """
+    if current_user.role != "dealer_user":
+        raise HTTPException(status_code=403, detail="Dealer users only")
+    
+    if not current_user.dealer_id:
+        raise HTTPException(status_code=400, detail="User has no assigned dealer_id")
+    
+    # Get ALL dealership stats (not just user's own)
+    dealer_videos_count = await results_collection.count_documents({
+        "dealer_id": current_user.dealer_id,
+        "status": BatchStatus.COMPLETED
+    })
+    
+    # Recent analyses from entire dealership
+    recent_analyses = await results_collection.find({
+        "dealer_id": current_user.dealer_id,
+        "status": BatchStatus.COMPLETED
+    }).sort("created_at", -1).limit(10).to_list(10)
+    
+    # User's personal stats
+    user_videos_count = await results_collection.count_documents({
+        "submitted_by_user_id": str(current_user.id),
+        "status": BatchStatus.COMPLETED
+    })
+    
+    return {
+        "dealer_videos_analyzed": dealer_videos_count,
+        "user_videos_analyzed": user_videos_count,
+        "recent_analyses": [clean_results(r) for r in recent_analyses],
+        "dealer_id": current_user.dealer_id
+    }
+
+@app.get("/dealer/results")
+async def get_dealer_results(
+    limit: int = 50,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Dealer user can see ALL results from their dealership"""
+    if current_user.role != "dealer_user":
+        raise HTTPException(status_code=403, detail="Dealer users only")
+    
+    if not current_user.dealer_id:
+        raise HTTPException(status_code=400, detail="User has no assigned dealer_id")
+    
+    results = await results_collection.find({
+        "dealer_id": current_user.dealer_id,
+        "status": BatchStatus.COMPLETED
+    }).sort("created_at", -1).limit(min(limit, 100)).to_list(None)
+    
+    return [clean_results(r) for r in results]
+
+@app.get("/dealer/my-results")
+async def get_my_personal_results(
+    limit: int = 50,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Dealer user can see ONLY their own results"""
+    if current_user.role != "dealer_user":
+        raise HTTPException(status_code=403, detail="Dealer users only")
+    
+    results = await results_collection.find({
+        "submitted_by_user_id": str(current_user.id),
+        "status": BatchStatus.COMPLETED
+    }).sort("created_at", -1).limit(min(limit, 100)).to_list(None)
+    
+    return [clean_results(r) for r in results]
+
+@app.delete("/results/{result_id}")
+async def delete_result(result_id: str, current_user: UserInDB = Depends(get_current_user)):
+    if not ObjectId.is_valid(result_id):
+        raise HTTPException(status_code=400, detail="Invalid Result ID format.")
+
+    result = await results_collection.find_one({"_id": ObjectId(result_id)})
+    if not result:
+        raise HTTPException(status_code=404, detail="Result not found.")
+
+    # Authorization checks
+    if current_user.role == "dealer_admin":
+        # Dealer admin can only delete results from their dealer
+        if current_user.dealer_id != result.get("dealer_id"):
+            raise HTTPException(status_code=403, detail="Not authorized to delete this result.")
+    
+    elif current_user.role == "dealer_user":
+        # Dealer user can only delete their OWN results
+        if result.get("submitted_by_user_id") != str(current_user.id):
+            raise HTTPException(status_code=403, detail="You can only delete your own analysis results.")
+    
+    elif current_user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="Not authorized to delete results.")
+
+    delete_operation = await results_collection.delete_one({"_id": ObjectId(result_id)})
+    if delete_operation.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Result not found for deletion (may have been already deleted).")
+
+    return JSONResponse(status_code=200, content={"success": True, "message": "Result deleted successfully."})
+@app.get("/dealer/my-analysis-tasks")
+async def get_my_dealer_analysis_tasks(
+    limit: int = 20,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """Dealer user can only see their own analysis tasks"""
+    if current_user.role != "dealer_user":
+        raise HTTPException(status_code=403, detail="Dealer users only")
+        
+    if analysis_tasks_collection is None:
+        raise HTTPException(status_code=500, detail="Analysis tasks collection not initialized")
+        
+    tasks_cursor = analysis_tasks_collection.find({
+        "submitted_by_user_id": str(current_user.id)
+    }).sort("created_at", -1).limit(limit)
+    
+    tasks = await tasks_cursor.to_list(length=limit)
+    
+    for task in tasks:
+        if '_id' in task:
+            task.pop('_id')
+    
+    return {"tasks": tasks}
+
 
 @app.get("/users/me", response_model=UserInDB)
 async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
