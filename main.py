@@ -49,6 +49,7 @@ analysis_tasks_collection = None
 
 load_dotenv()
 
+
 # -----------------------------
 # Logging Configuration
 # -----------------------------
@@ -69,10 +70,13 @@ PROCESS_TIMEOUT_SECONDS = int(os.getenv("PROCESS_TIMEOUT_SECONDS", "900")) # 15 
 BULK_RESULTS_BASE_DIR = os.getenv("BULK_RESULTS_BASE_DIR", "bulk_analysis_reports")
 os.makedirs(BULK_RESULTS_BASE_DIR, exist_ok=True)
 logger.info(f"Bulk analysis reports will be stored in: {BULK_RESULTS_BASE_DIR}")
-
 # CORS Origins
-_frontend_urls_env = os.getenv("FRONTEND_URLS", "http://localhost:3000,http://localhost:3001,http://localhost:5173,http://127.0.0.1:5173")
+_frontend_urls_env = os.getenv(
+    "FRONTEND_URLS",
+    "https://focusadmin.focusengineeringapp.com,https://focus-user.focusengineeringapp.com,https://videoapi.focusengineeringapp.com"
+)
 CORS_ORIGINS = [url.strip() for url in _frontend_urls_env.split(',')]
+
 
 # JWT Configuration
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-this-in-prod!") # IMPORTANT: Change this in production
@@ -123,12 +127,12 @@ class TokenData(BaseModel):
 class UserBase(BaseModel):
     username: str
     email: Optional[str] = None
+    showroom_name: Optional[str] = None
 
 class UserCreate(UserBase):
     password: str
     role: str = "dealer_user" # Default role for new users
     dealer_id: Optional[str] = None # Simple string field for dealer identification
-    
 class UserUpdate(BaseModel):
     # every field optional – update only what is provided
     username: Optional[str] = None
@@ -136,7 +140,7 @@ class UserUpdate(BaseModel):
     role:   Optional[str] = None        # 'dealer_admin' | 'super_admin'
     password: Optional[str] = None      # will be re-hashed if present
     dealer_id: Optional[str] = None     # simple string (your simplified schema)
-
+    showroom_name: Optional[str] = None
 
 class UserInDB(UserBase):
     id: str = Field(alias="_id")  # This should accept ObjectId converted to string
@@ -218,6 +222,13 @@ class DealerAdminDashboardOverview(BaseModel):
     low_quality_audio_count: int
     recent_analyses: List[RecentAnalysis]
     last_updated: dt
+
+class ProfileUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+
 
 
 # -----------------------------
@@ -493,23 +504,20 @@ async def lifespan(app: FastAPI):
 # -----------------------------
 
 # Add this RIGHT AFTER creating your FastAPI app
+
+# Add this RIGHT AFTER creating your FastAPI app
 app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan, default_response_class=ORJSONResponse)
+
 
 # COMPLETE CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173", 
-        "http://localhost:3000",
-        "http://127.0.0.1:3000"
-    ],
+    allow_origins=CORS_ORIGINS,  # dynamically loaded from env
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Add this OPTIONS handler for preflight requests
 @app.options("/{rest_of_path:path}")
 async def preflight_handler():
     return JSONResponse(content={"status": "ok"})
@@ -520,12 +528,7 @@ async def add_cors_header(request: Request, call_next):
     response = await call_next(request)
     origin = request.headers.get("origin")
     
-    allowed_origins = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000"
-    ]
+    allowed_origins = CORS_ORIGINS  # use same allowed list
     
     if origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
@@ -534,8 +537,7 @@ async def add_cors_header(request: Request, call_next):
         response.headers["Access-Control-Allow-Credentials"] = "true"
     
     return response
-
-# -----------------------------
+#-----------------------------
 # Authentication Endpoints
 # -----------------------------
 @app.post("/token", response_model=Token)
@@ -550,6 +552,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     
     # dealer_id is now stored as string, no conversion needed
     dealer_id_str = user_doc.get("dealer_id")
+    showroom_name = user_doc.get("showroom_name")
 
     access_token_expires = timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -558,6 +561,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             "user_id": str(user_doc["_id"]),
             "role": user_doc["role"],
             "dealer_id": dealer_id_str,
+	    "showroom_name": showroom_name,
         },
         expires_delta=access_token_expires,
     )
@@ -614,15 +618,18 @@ async def dealer_portal_login(form_data: OAuth2PasswordRequestForm = Depends()):
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
     # RESTRICT: Only allow dealer users to login via dealer portal
     if user_doc["role"] != "dealer_user":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Please use the admin portal to login"
         )
-    
     dealer_id_str = user_doc.get("dealer_id")
+    dealer_admin = await users_collection.find_one({
+        "dealer_id": dealer_id_str, 
+        "role": "dealer_admin"
+    })
+    dealership_showroom_name = dealer_admin.get("showroom_name") if dealer_admin else None
 
     access_token_expires = timedelta(minutes=JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -631,6 +638,7 @@ async def dealer_portal_login(form_data: OAuth2PasswordRequestForm = Depends()):
             "user_id": str(user_doc["_id"]),
             "role": user_doc["role"],
             "dealer_id": dealer_id_str,
+            "showroom_name": dealership_showroom_name,  
         },
         expires_delta=access_token_expires,
     )
@@ -766,6 +774,84 @@ async def get_my_dealer_analysis_tasks(
 async def read_users_me(current_user: UserInDB = Depends(get_current_user)):
     return current_user
 
+@app.put("/users/me", response_model=UserInDB)
+async def update_user_profile(
+    profile_data: ProfileUpdate,
+    current_user: UserInDB = Depends(get_current_user)
+):
+    """
+    Update current user's profile (username, email, password)
+    """
+    updates = {}
+    
+    # Check if username is being updated
+    if profile_data.username is not None:
+        if profile_data.username.strip() == "":
+            raise HTTPException(status_code=400, detail="Username cannot be empty")
+        
+        # Check if username already exists (excluding current user)
+        existing_user = await users_collection.find_one({
+            "username": profile_data.username,
+            "_id": {"$ne": ObjectId(current_user.id)}
+        })
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Username already exists")
+        updates["username"] = profile_data.username.strip()
+    
+    # Check if email is being updated
+    if profile_data.email is not None:
+        if profile_data.email.strip() == "":
+            raise HTTPException(status_code=400, detail="Email cannot be empty")
+        
+        # Basic email validation
+        email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_regex, profile_data.email):
+            raise HTTPException(status_code=400, detail="Invalid email format")
+        
+        # Check if email already exists (excluding current user)
+        existing_user = await users_collection.find_one({
+            "email": profile_data.email,
+            "_id": {"$ne": ObjectId(current_user.id)}
+        })
+        if existing_user:
+            raise HTTPException(status_code=400, detail="Email already exists")
+        updates["email"] = profile_data.email.strip()
+    
+    # Handle password change if requested - NO CURRENT PASSWORD REQUIRED
+    if profile_data.new_password is not None:
+        # Validate new password
+        if len(profile_data.new_password) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters long")
+        
+        # Hash and set new password
+        updates["hashed_password"] = get_password_hash(profile_data.new_password)
+    
+    # If no valid updates, return error
+    if not updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    # Add update timestamp
+    updates["updated_at"] = dt.utcnow()
+    
+    # Update user in database
+    result = await users_collection.update_one(
+        {"_id": ObjectId(current_user.id)},
+        {"$set": updates}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to update profile")
+    
+    # Fetch and return updated user
+    updated_user_doc = await users_collection.find_one({"_id": ObjectId(current_user.id)})
+    if not updated_user_doc:
+        raise HTTPException(status_code=404, detail="User not found after update")
+    
+    # Convert ObjectId to string
+    updated_user_doc["_id"] = str(updated_user_doc["_id"])
+    
+    return UserInDB(**updated_user_doc)
+
 
 # ===============================
 # User Management Endpoints (RBAC Enhanced)
@@ -808,12 +894,15 @@ async def create_user(user: UserCreate, current_user: UserInDB = Depends(get_cur
     if current_user.role == "super_admin":
         allowed_role = user.role  # super_admin can create any role
         allowed_dealer = user.dealer_id
+        allowed_showroom = user.showroom_name
     elif current_user.role == "dealer_admin":
         # Dealer admin can only create dealer_user (not dealer_admin or super_admin)
         if user.role not in ["dealer_user", "dealer_admin"]:
             raise HTTPException(status_code=403, detail="Dealer admins can only create dealer_user accounts")
         allowed_role = user.role
         allowed_dealer = current_user.dealer_id  # Force their dealer_id
+        allowed_showroom = current_user.showroom_name
+
     else:
         raise HTTPException(403, detail="Not authorized to create user.")
 
@@ -824,6 +913,7 @@ async def create_user(user: UserCreate, current_user: UserInDB = Depends(get_cur
         "hashed_password": hashed_password,
         "role": allowed_role,
         "dealer_id": allowed_dealer,
+	"showroom_name": allowed_showroom,
         "created_at": dt.utcnow(),
         "updated_at": dt.utcnow()
     }
@@ -879,7 +969,8 @@ async def update_user(user_id: str, payload: UserUpdate, current_user: UserInDB 
     if payload.dealer_id is not None and current_user.role == "super_admin":
         # Only super admin may change dealer_id
         updates["dealer_id"] = payload.dealer_id
-
+    if payload.showroom_name is not None:  
+        updates["showroom_name"] = payload.showroom_name
     if not updates:
         raise HTTPException(400, detail="No valid fields to update.")
 
